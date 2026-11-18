@@ -8,9 +8,12 @@
       * Switches to a temporary COPY of your current power plan, named "Training Mode (temporary)".
         Your own power plans are never edited. The copy has:
           - never sleep / never hibernate (so long runs are not interrupted)
+          - power button and keyboard sleep key turn the display off instead
           - display turns off after N minutes
           - CPU allowed to idle down (minimum state 5%, energy preference 25 = the Windows Balanced values)
       * Caps the NVIDIA GPU power limit to a percentage of stock (nvidia-smi -pl). Needs admin.
+      * Hides Sleep in the Start menu's power menu until training mode ends (needs admin), and if the
+        PC sleeps anyway, says when, for how long and what started it.
       * Saves what it is about to change to %LOCALAPPDATA%\TrainingMode\state.json BEFORE changing it,
         and registers a one-time "switch the power plan back at next sign-in" entry (HKCU RunOnce)
         in case the PC restarts while training mode is on. (The GPU limit resets itself on restart.)
@@ -75,6 +78,7 @@ $script:TempSchemeName = 'Training Mode (temporary)'
 $script:CalmSchemeGuid = 'c0de7a1e-7ea1-4000-8000-00000ca1a001'
 $script:CalmSchemeName = 'Calm Mode (temporary)'
 $script:OurSchemes     = @($script:TempSchemeGuid, $script:CalmSchemeGuid)
+$script:FlyoutKey      = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FlyoutMenuSettings'
 $script:BalancedGuid   = '381b4222-f694-41f0-9685-ff5bb260df2e'
 $script:RunOnceKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
 $script:RunOnceName    = 'TrainingModeSwitchBack'
@@ -224,12 +228,74 @@ function Get-PlanTweaks([int]$DisplayOffMinutes, [string]$Mode = 'training') {
     @(
         @{ Sub = 'SUB_SLEEP';     Setting = 'STANDBYIDLE';      Value = 0;                        Label = 'never sleep' }
         @{ Sub = 'SUB_SLEEP';     Setting = 'HIBERNATEIDLE';    Value = 0;                        Label = 'never hibernate' }
+        # 4 = "Turn off the display": a stray press of the power button or a keyboard sleep key can't end the run.
+        @{ Sub = 'SUB_BUTTONS';   Setting = 'PBUTTONACTION';    Value = 4;                        Label = 'power button turns the display off' }
+        @{ Sub = 'SUB_BUTTONS';   Setting = 'SBUTTONACTION';    Value = 4;                        Label = 'sleep button turns the display off' }
         @{ Sub = 'SUB_VIDEO';     Setting = 'VIDEOIDLE';        Value = ($DisplayOffMinutes * 60); Label = 'display timeout' }
         @{ Sub = 'SUB_PROCESSOR'; Setting = 'PROCTHROTTLEMIN';  Value = 5;                        Label = 'CPU minimum state (P-cores)' }
         @{ Sub = 'SUB_PROCESSOR'; Setting = 'PROCTHROTTLEMIN1'; Value = 5;                        Label = 'CPU minimum state (E-cores)' }
         @{ Sub = 'SUB_PROCESSOR'; Setting = 'PERFEPP';          Value = 25;                       Label = 'CPU energy preference (P-cores)' }
         @{ Sub = 'SUB_PROCESSOR'; Setting = 'PERFEPP1';         Value = 25;                       Label = 'CPU energy preference (E-cores)' }
     )
+}
+
+# Start menu "Sleep": hidden while training, put back exactly as it was afterwards.
+# (Same switch as Control Panel > Power Options > "Show in Power menu: Sleep". Needs admin.)
+function Hide-StartMenuSleep($State) {
+    if ($State.PSObject.Properties.Name -contains 'sleepMenu' -and $State.sleepMenu -and $State.sleepMenu.hidden) { return }
+    $keyExisted = Test-Path -LiteralPath $script:FlyoutKey
+    $prev = Get-ItemProperty -LiteralPath $script:FlyoutKey -Name ShowSleepOption -ErrorAction SilentlyContinue
+    $had = $null -ne $prev
+    $prevVal = if ($had) { [int]$prev.ShowSleepOption } else { $null }
+    if ($had -and $prevVal -eq 0) { Write-TMLog 'Start menu: Sleep was already hidden.'; return }
+    # Record the original before changing it.
+    Set-StateProp $State 'sleepMenu' ([pscustomobject]@{ hidden = $false; keyExisted = $keyExisted; hadValue = $had; previous = $prevVal })
+    Write-JsonFile $script:StatePath $State
+    if ($DryRun) {
+        Write-TMLog "[dry run] set $script:FlyoutKey ShowSleepOption = 0"
+        $State.sleepMenu.hidden = $true
+        return
+    }
+    try {
+        if (-not $keyExisted) { New-Item -Path $script:FlyoutKey -Force -ErrorAction Stop | Out-Null }
+        New-ItemProperty -LiteralPath $script:FlyoutKey -Name ShowSleepOption -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        $State.sleepMenu.hidden = $true
+        Write-JsonFile $script:StatePath $State
+        Write-TMLog 'Start menu: Sleep hidden while training (power and sleep buttons turn the display off instead).' 'ok'
+    } catch {
+        $why = if (-not $script:IsAdmin) { 'needs administrator rights' } else { "$_" }
+        Write-TMLog "Could not hide Sleep in the Start menu ($why)." 'warn'
+    }
+}
+
+function Restore-StartMenuSleep($State) {
+    if (-not ($State -and $State.PSObject.Properties.Name -contains 'sleepMenu' -and $State.sleepMenu -and $State.sleepMenu.hidden)) { return $true }
+    $m = $State.sleepMenu
+    if ($DryRun) {
+        Write-TMLog "[dry run] restore $script:FlyoutKey ShowSleepOption"
+        $m.hidden = $false
+        return $true
+    }
+    try {
+        if ($m.hadValue) {
+            Set-ItemProperty -LiteralPath $script:FlyoutKey -Name ShowSleepOption -Value ([int]$m.previous) -Type DWord -ErrorAction Stop
+        } else {
+            Remove-ItemProperty -LiteralPath $script:FlyoutKey -Name ShowSleepOption -ErrorAction SilentlyContinue
+            if (-not $m.keyExisted -and (Test-Path -LiteralPath $script:FlyoutKey)) {
+                $k = Get-Item -LiteralPath $script:FlyoutKey
+                if ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) {
+                    Remove-Item -LiteralPath $script:FlyoutKey -Confirm:$false -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        $m.hidden = $false
+        Write-TMLog 'Start menu: Sleep is back.' 'ok'
+        return $true
+    } catch {
+        $why = if (-not $script:IsAdmin) { 'needs administrator rights: open the app normally' } else { "$_" }
+        Write-TMLog "Could not put Sleep back in the Start menu ($why)." 'warn'
+        return $false
+    }
 }
 
 # One-time entry that switches the power plan back at next sign-in, in case the PC restarts while on.
@@ -434,7 +500,10 @@ function Switch-Mode {
         return $false
     }
 
-    # 2. GPU: training = cap at the chosen %, Calm = back to your normal limit.
+    # 2. Start menu Sleep: hidden only while training.
+    if ($Mode -eq 'training') { Hide-StartMenuSleep $State } else { [void](Restore-StartMenuSleep $State) }
+
+    # 3. GPU: training = cap at the chosen %, Calm = back to your normal limit.
     if ($Mode -eq 'training' -and -not $script:NvSmi) {
         Write-TMLog 'No NVIDIA tools (nvidia-smi) found, so the GPU power cap was skipped.' 'warn'
     }
@@ -464,7 +533,7 @@ function Switch-Mode {
         Write-TMLog 'Changing the GPU power cap needs administrator rights. Open the app normally and accept the admin prompt.' 'warn'
     }
 
-    # 3. Update the record (the original plan and GPU limits are never overwritten).
+    # 4. Update the record (the original plan and GPU limits are never overwritten).
     Set-StateProp $State 'mode' $Mode
     Set-StateProp $State 'modeSince' ((Get-Date).ToString('o'))
     Set-StateProp $State 'displayOffMinutes' $DisplayOffMinutes
@@ -562,13 +631,19 @@ function Disable-TrainingMode {
         }
     }
 
-    # 3. Safety net + record.
+    # 3. Start menu Sleep.
+    if ($state -and -not (Restore-StartMenuSleep $state)) { $allOk = $false }
+
+    # 4. Safety net + record.
     if ($allOk) {
         Unregister-SwitchBackAtLogon
         if (Test-Path -LiteralPath $script:StatePath) { Remove-Item -LiteralPath $script:StatePath -Force }
         Write-TMLog 'Back to normal.' 'ok'
     } else {
-        if ($state) { Register-SwitchBackAtLogon $state.originalScheme }
+        if ($state) {
+            Register-SwitchBackAtLogon $state.originalScheme
+            Write-JsonFile $script:StatePath $state
+        }
         Write-TMLog 'Some settings could not be restored (see above). Try "Back to normal" again.' 'warn'
     }
     return $allOk
@@ -685,6 +760,31 @@ function Step-AutoSwitchBack {
     return $Tracker
 }
 
+# Looks in the Windows event log for a sleep between $From and $To, and what asked for it.
+function Get-SleepInfo([datetime]$From, [datetime]$To) {
+    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42, 187
+                                             StartTime = $From.AddSeconds(-10); EndTime = $To.AddSeconds(5) } -ErrorAction SilentlyContinue)
+    $sleep = $ev | Where-Object { $_.Id -eq 42 } | Sort-Object TimeCreated | Select-Object -First 1
+    if (-not $sleep) { return $null }
+    $cause = $null
+    $call = $ev | Where-Object { $_.Id -eq 187 } | Sort-Object TimeCreated | Select-Object -First 1
+    if ($call) {
+        $name = ([xml]$call.ToXml()).Event.EventData.Data | Where-Object { $_.Name -eq 'ApiCallerName' } | ForEach-Object { $_.'#text' }
+        if ($name -match 'StartMenuExperienceHost') { $cause = 'the Start menu Sleep button' }
+        elseif ($name) { $cause = Split-Path -Leaf $name }
+    }
+    if (-not $cause) {
+        $reason = if ($sleep.Message -match 'Sleep Reason:\s*(.+)') { $Matches[1].Trim() } else { '' }
+        $cause = switch -Regex ($reason) {
+            'Button|Lid' { 'the power or sleep button' }
+            'Idle'       { 'the idle timer' }
+            ''           { 'an unknown cause' }
+            default      { $reason }
+        }
+    }
+    return [pscustomobject]@{ SleptAt = $sleep.TimeCreated; Cause = $cause }
+}
+
 function Reset-AutoSwitchBack {
     $script:RT.Armed = $false
     $script:RT.BusySince = $null
@@ -798,6 +898,7 @@ function Invoke-ModeChange([string]$To) {
             'training' {
                 Save-UiSettings
                 Reset-AutoSwitchBack
+                $RT.SleepNotice = $null
                 [void](Start-Mode 'training' $UI.Track.Value $mins)
             }
             'calm' {
@@ -899,6 +1000,24 @@ function Update-Ui {
     $UI.Track.Enabled = $mode -ne 'training'
     $UI.Display.Enabled = $mode -ne 'training'
 
+    # Did the PC sleep while training? A gap between timer ticks means the app was frozen; the event log says why.
+    if ($Tick) {
+        $nowT = Get-Date
+        if ($RT.LastTick -and $mode -eq 'training' -and ($nowT - $RT.LastTick).TotalSeconds -gt 60) {
+            $info = Get-SleepInfo $RT.LastTick $nowT
+            if ($info) {
+                $RT.SleepNotice = 'The PC slept during training from {0:t} to {1:t} ({2}), started by {3}. Check that your training is still running.' -f
+                                  $info.SleptAt, $nowT, (Format-Duration ($nowT - $info.SleptAt)), $info.Cause
+                Write-TMLog $RT.SleepNotice 'warn'
+                $RT.BusySince = $null
+                $RT.IdleSince = $null
+                Show-MainWindow
+                $UI.Tray.ShowBalloonTip(8000, 'Training was interrupted', $RT.SleepNotice, [System.Windows.Forms.ToolTipIcon]::Warning)
+            }
+        }
+        $RT.LastTick = $nowT
+    }
+
     # Detect when training is done (GPU busy for a while, then idle for N minutes).
     if ($mode -eq 'training' -and $UI.Auto.Checked) {
         $mins = $script:AutoChoices[[math]::Max(0, $UI.AutoMins.SelectedIndex)]
@@ -932,6 +1051,7 @@ function Update-Ui {
 
     # Warnings
     $warn = @($st.Warnings)
+    if ($RT.SleepNotice) { $warn = @($RT.SleepNotice) + $warn }
     if (-not $script:IsAdmin -and -not $DryRun -and $script:NvSmi) {
         $warn += 'Not running as administrator, so the GPU power cap cannot be changed.'
     }
@@ -947,9 +1067,12 @@ function Show-WhatChanges {
         'Start training mode:'
         "  $b Switches to a temporary COPY of your current power plan (""$script:TempSchemeName""). Your own plans are never edited. The copy:"
         '       - never sleeps or hibernates, so long runs are not interrupted'
+        '       - the power button and keyboard sleep key turn the display off instead of sleeping or shutting down'
         '       - turns the display off after the time you pick'
         '       - lets the CPU idle down when it is only feeding the GPU (minimum state 5%, energy preference 25: the Windows Balanced values)'
         "  $b Caps the GPU power limit at the % you pick (nvidia-smi -pl)."
+        "  $b Hides Sleep in the Start menu's power menu, so it can't be clicked by habit mid-run."
+        "  $b If the PC sleeps anyway, the app tells you when, for how long and what started it."
         "  $b Saves your originals first, in $StateDir"
         "  $b If the PC restarts while it is on, the power plan switches back at the next sign-in (the GPU cap resets on restart by itself)."
         ''
@@ -960,7 +1083,7 @@ function Show-WhatChanges {
         ''
         'Back to normal:'
         "  $b Re-activates your original power plan and deletes the temporary copies."
-        "  $b Restores the GPU power limit to what it was."
+        "  $b Restores the GPU power limit to what it was, and puts Sleep back in the Start menu."
         ''
         'Nothing else on your system is changed.'
     ) -join "`n"
@@ -1006,7 +1129,8 @@ function Show-TrainingModeGui {
     $C = $script:C
     $script:UI = @{ Ready = $false }
     $script:RT = @{ Armed = $false; BusySince = $null; IdleSince = $null; Fire = $false
-                    TrayHintShown = $false; ForceExit = $false; Busy = $false }
+                    TrayHintShown = $false; ForceExit = $false; Busy = $false
+                    LastTick = $null; SleepNotice = $null }
     $UI = $script:UI
     $settings = Get-Settings
     $UI.Gpus = @(Get-GpuInfo)

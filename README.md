@@ -19,19 +19,30 @@ Minimizing the window sends it to the system tray. It keeps watching from there,
 | Mode | Power plan | GPU | Tray icon |
 |---|---|---|---|
 | **Normal** | Your own plan (e.g. Ultimate Performance), untouched | Your normal limit | gray |
-| **Training** | Temporary copy "Training Mode (temporary)": never sleeps or hibernates, display off after N min, CPU can idle down (min 5%, energy preference 25, the Windows Balanced values) | Capped at the % you pick | green |
+| **Training** | Temporary copy "Training Mode (temporary)": never sleeps or hibernates, the power button and keyboard sleep key turn the display off instead, display off after N min, CPU can idle down (min 5%, energy preference 25, the Windows Balanced values) | Capped at the % you pick | green |
 | **Calm** | Temporary copy "Calm Mode (temporary)": CPU prefers efficiency (min 5%, energy preference 60, the Windows Power saver values, with no speed cap), display off after N min, sleep as in your normal plan | Back to your normal limit | teal |
 
 Calm mode is meant for after everything's done, or for light and remote work: the PC stays on and responsive but stops running full blast. It stays on until you click Back to normal, even if you close the app.
+
+### Sleep protection during training
+
+"Never sleep" only stops *automatic* sleep. Windows always obeys a deliberate Sleep, so while training mode is on the app also:
+
+- **Hides Sleep from the Start menu's power menu.** This is the same switch as Control Panel → Power Options → "Show in Power menu: Sleep". It comes back when training mode ends.
+- **Makes the power button and keyboard sleep key turn the display off** instead of sleeping or shutting down. This lives in the temporary training plan, so it disappears with that plan.
+- **Tells you if the PC slept anyway.** The window, a tray notification and the log say when it slept, for how long and what started it. Check that your training is still running.
+
+A program or command can still force sleep; these steps cover the usual accidental clicks and button presses.
 
 ## How "Back to normal" undoes everything
 
 - Your original power plan is made active again, and both temporary copies are deleted. Your own plans are never edited.
 - The GPU limit you had before is restored. A restart also resets it.
+- Sleep is put back in the Start menu exactly as it was.
 
 Before changing anything, the app saves your original settings to `%LOCALAPPDATA%\TrainingMode\state.json`. That folder also holds `settings.json` (your last choices) and `log.txt`.
 
-**If the PC restarts while training or Calm mode is on**, the power plan switches back to normal at the next sign-in by itself. This works through a one-time Windows "RunOnce" entry that deletes itself after it runs. The next time you open the app, it finishes the cleanup.
+**If the PC restarts while training or Calm mode is on**, the power plan switches back to normal at the next sign-in by itself. This works through a one-time Windows "RunOnce" entry that deletes itself after it runs. The next time you open the app, it finishes the cleanup. If the restart happened during training, that includes putting Sleep back in the Start menu, which needs the app to be opened.
 
 ## Command line (optional)
 
